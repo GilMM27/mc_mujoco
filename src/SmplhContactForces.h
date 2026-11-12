@@ -19,6 +19,7 @@ struct Snapshot
   std::array<double, 14> peakPositiveNormalSumN{};
   bool externalTorqueFeedback = false;
   bool highPassCompensation = false;
+  double externalJointTorqueNormNm = 0;
   bool selectedPointValid = false;
   double selectedPointTime = 0;
   size_t selectedRegion = 0;

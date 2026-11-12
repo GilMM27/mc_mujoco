@@ -511,6 +511,19 @@ public:
   }
   void setContactSelection(const smplh_contact::Selection & selection) { contactSelection_ = selection; }
 
+  void captureExternalJointTorqueNorm(const mjModel * m, const mjData * d,
+                                      const std::vector<int> & robotDofs)
+  {
+    double norm2 = 0;
+    for(int dof : robotDofs)
+      if(dof >= 0 && dof < m->nv)
+      {
+        const double external = d->qfrc_constraint[dof] + d->qfrc_passive[dof];
+        norm2 += external * external;
+      }
+    contactForces_.externalJointTorqueNormNm = std::sqrt(norm2);
+  }
+
   // Compare forces at the controller's currently selected closest point. The
   // MuJoCo value is the normal component at the nearest solved manifold point;
   // the torque value is the least-squares projection onto J(point)^T * (-normal).

@@ -1225,6 +1225,7 @@ void MjSimImpl::simStep()
     for(size_t i = 0; i < selected->mj_jnt_ids.size(); ++i)
       if(selected->mj_mot_ids[i] >= 0 || selected->mj_pos_act_ids[i] >= 0)
         robotDofs.push_back(model->jnt_dofadr[selected->mj_jnt_ids[i]]);
+    smplh_bridge_.captureExternalJointTorqueNorm(model, data, robotDofs);
     smplh_bridge_.captureSelectedPointComparison(model, data, robotDofs, selected->prefix);
   }
   mj_forward(model, data);
