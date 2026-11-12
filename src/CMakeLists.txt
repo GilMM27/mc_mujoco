@@ -38,6 +38,7 @@ set(mc_mujoco_lib_SRC
     mj_utils_merge_mujoco_models.cpp
     mj_sim.h
     mj_sim_impl.h
+    SmplhDistanceWorker.h
     mj_utils.h
     ${uitools_SRC}
     MujocoClient.cpp
@@ -96,6 +97,8 @@ add_library(
   ${mc_rtc-imgui-SRC}
   ${mc_rtc-imgui-HDR}
   $<TARGET_OBJECTS:pugixml>)
+target_include_directories(mc_mujoco_lib PRIVATE ${SCH_CORE_INCLUDE_DIRS})
+target_link_libraries(mc_mujoco_lib PRIVATE fcl ${SCH_CORE_LIBRARIES} human_robot_distance_api::human_robot_distance_api)
 if(uitools_is_platform_ui_adapter)
   target_compile_definitions(mc_mujoco_lib PRIVATE USE_UI_ADAPTER)
 endif()
@@ -158,7 +161,7 @@ install(
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib)
 
-install(FILES mj_sim.h mj_configuration.h DESTINATION include/mc_mujoco)
+install(FILES mj_sim.h mj_configuration.h SmplhContactForces.h DESTINATION include/mc_mujoco)
 
 install(
   TARGETS mc_mujoco_lib

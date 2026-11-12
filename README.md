@@ -1,5 +1,26 @@
 # mujoco interface for mc-rtc
 
+## SMPL-H contact measurements in this fork
+
+The [superbuild playback guide](https://github.com/GilMM27/safe-hri-mc-rtc-superbuild/blob/feat/smplh-contact-forces/smplh_playback/README.md)
+describes preparing a licensed motion cache and setting `SMPLH_CACHE`.
+`SmplhBridge` reads that cache, animates 14 contact capsules, and publishes
+`smplh_contact_forces` to the mc_rtc datastore. Each region's solved normal
+force sums positive `mj_contactForce` values immediately after `mj_step`.
+
+The controller writes its closest region/link witness, body, normal, and time
+to the `smplh_contact_selection` datastore entry. On the next MuJoCo step the
+bridge compares the nearest solved contact on that body and region with an
+external-torque estimate projected onto `J(point)^T * (-normal)`. The snapshot
+includes both normal forces, their signed difference, the region index, and
+the distance between the selected witness and solved contact point. The
+MuJoCo value is from the nearest point in the contact manifold; it can differ
+from the controller witness. The torque projection uses the controlled robot
+joints' constraint torques, so other active constraints can affect it. A
+comparison is valid only when the selection is recent and a solved contact
+matches its body and region. This is a simulation diagnostic, not a physical
+force measurement.
+
 ![Screenshot from 2022-08-12 17-09-16](https://user-images.githubusercontent.com/16384313/188832982-1a1263e4-ce33-4dc7-804a-589d151670b3.png)
 
 ## Usage

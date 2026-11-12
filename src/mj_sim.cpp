@@ -2,6 +2,7 @@
 #include "mj_utils.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -166,6 +167,21 @@ MjSimImpl::MjSimImpl(const MjConfiguration & config)
     objects.push_back(object);
 
     std::string module = co.second("module");
+    // SMPLH_CACHE model: keep scene geometry and playback from the same cache.
+    if(module == "smplh")
+    {
+      if(const char * cache = std::getenv("SMPLH_CACHE"))
+      {
+        fs::path cachePath(cache);
+        if(cachePath.filename() == "smplh_cache.bin") cachePath = cachePath.parent_path();
+        const auto xmlFile = cachePath / "human.xml";
+        if(!fs::exists(xmlFile))
+          mc_rtc::log::error_and_throw<std::runtime_error>(
+              "[mc_mujoco] SMPLH_CACHE model cannot be found at {}", xmlFile.string());
+        mjObjects[object.name] = xmlFile.string();
+        continue;
+      }
+    }
     auto object_cfg_path = get_robot_cfg_path(module);
     if(object_cfg_path.empty())
     {
@@ -594,6 +610,8 @@ void MjSimImpl::setSimulationInitialState()
     }
   }
   mj_forward(model, data);
+  smplh_bridge_.configureContactSizes(controller->controller().config());
+  smplh_bridge_.update(model, data);
 }
 
 void MjSimImpl::setObjectPosW(const std::string & object, const sva::PTransformd & pt)
@@ -1014,6 +1032,22 @@ void MjSimImpl::updateData()
   }
 }
 
+const MjRobot * MjSimImpl::contactRobot() const
+{
+  if(controller)
+  {
+    const auto & name = controller->controller().robot().name();
+    const auto it = std::find_if(robots.begin(), robots.end(),
+                                 [&](const MjRobot & robot) { return robot.name == name; });
+    if(it != robots.end()) return &*it;
+  }
+  const auto it = std::find_if(robots.begin(), robots.end(), [](const MjRobot & robot) {
+    return std::any_of(robot.mj_mot_ids.begin(), robot.mj_mot_ids.end(), [](int id) { return id >= 0; })
+           || std::any_of(robot.mj_pos_act_ids.begin(), robot.mj_pos_act_ids.end(), [](int id) { return id >= 0; });
+  });
+  return it == robots.end() ? nullptr : &*it;
+}
+
 void MjRobot::updateControl(const mc_rbdyn::Robot & robot)
 {
   mj_prev_ctrl_q = mj_next_ctrl_q;
@@ -1110,10 +1144,22 @@ bool MjSimImpl::controlStep()
   {
     pending_body_forces_.clear();
     // run the controller
-    if(!controller->run())
+    auto & smplh_store = controller->controller().datastore();
+    if(!smplh_store.has(human_robot_distance::datastoreKey)) smplh_store.make<human_robot_distance::Snapshot>(human_robot_distance::datastoreKey);
+    smplh_store.assign<human_robot_distance::Snapshot>(human_robot_distance::datastoreKey, smplh_bridge_.snapshot());
+    if(!smplh_store.has(smplh_contact::datastoreKey)) smplh_store.make<smplh_contact::Snapshot>(smplh_contact::datastoreKey);
+    auto smplh_forces = smplh_bridge_.contactForces();
+    if(const auto * robot = contactRobot())
     {
-      return true;
+      smplh_forces.externalTorqueFeedback = robot->use_external_torques;
+      smplh_forces.highPassCompensation = robot->use_hp_filter_ext_torques && robot->hp_filter_ext_torques_gain < 0;
     }
+    smplh_store.assign<smplh_contact::Snapshot>(smplh_contact::datastoreKey, smplh_forces);
+    const bool controllerRunning = controller->run();
+    if(smplh_store.has(smplh_contact::selectionDatastoreKey))
+      smplh_bridge_.setContactSelection(
+          smplh_store.get<smplh_contact::Selection>(smplh_contact::selectionDatastoreKey));
+    if(!controllerRunning) return true;
     for(auto & r : robots)
     {
       r.updateControl(controller->robots().robot(r.name));
@@ -1169,7 +1215,21 @@ void MjSimImpl::simStep()
 
   // take one step in simulation
   // model.opt.timestep will be used here
+  smplh_bridge_.beforeStep(model, data);
+  smplh_bridge_.guardPositionControls(model, data);
   mj_step(model, data);
+  smplh_bridge_.captureContactStats(model, data);
+  if(const auto * selected = contactRobot())
+  {
+    std::vector<int> robotDofs;
+    for(size_t i = 0; i < selected->mj_jnt_ids.size(); ++i)
+      if(selected->mj_mot_ids[i] >= 0 || selected->mj_pos_act_ids[i] >= 0)
+        robotDofs.push_back(model->jnt_dofadr[selected->mj_jnt_ids[i]]);
+    smplh_bridge_.captureExternalJointTorqueNorm(model, data, robotDofs);
+    smplh_bridge_.captureSelectedPointComparison(model, data, robotDofs, selected->prefix);
+  }
+  mj_forward(model, data);
+  smplh_bridge_.update(model, data);
   mju_zero(data->qfrc_applied, model->nv);
 
   wallclock = data->time;
@@ -1212,6 +1272,17 @@ bool MjSimImpl::stepSimulation()
     if(controller)
     {
       controller->running = false;
+      auto & smplh_paused_store = controller->controller().datastore();
+      if(!smplh_paused_store.has(human_robot_distance::datastoreKey)) smplh_paused_store.make<human_robot_distance::Snapshot>(human_robot_distance::datastoreKey);
+      smplh_paused_store.assign<human_robot_distance::Snapshot>(human_robot_distance::datastoreKey, smplh_bridge_.snapshot());
+      if(!smplh_paused_store.has(smplh_contact::datastoreKey)) smplh_paused_store.make<smplh_contact::Snapshot>(smplh_contact::datastoreKey);
+      auto smplh_forces = smplh_bridge_.contactForces();
+      if(const auto * robot = contactRobot())
+      {
+        smplh_forces.externalTorqueFeedback = robot->use_external_torques;
+        smplh_forces.highPassCompensation = robot->use_hp_filter_ext_torques && robot->hp_filter_ext_torques_gain < 0;
+      }
+      smplh_paused_store.assign<smplh_contact::Snapshot>(smplh_contact::datastoreKey, smplh_forces);
       controller->run();
       controller->running = true;
     }
@@ -1266,7 +1337,13 @@ void MjSimImpl::updateScene()
 
   // update scene and render
   std::lock_guard<std::mutex> lock(rendering_mutex_);
+#ifdef USE_UI_ADAPTER
+  smplh_bridge_.upload(model, &platform_ui_adapter->mjr_context());
+#else
+  smplh_bridge_.upload(model, &context);
+#endif
   mjv_updateScene(model, data, &options, &pert, &camera, mjCAT_ALL, &scene);
+  smplh_bridge_.renderDistanceOverlay(&scene);
 
   if(client)
   {
@@ -1335,8 +1412,26 @@ bool MjSimImpl::render()
       mj_sim_dt_average += mj_sim_dt[i] / nsamples;
     }
     ImGui::Text("Average sim time: %.2fμs", mj_sim_dt_average);
-    ImGui::Text("Simulation/Real time: %.2f", mj_sim_dt_average / (1e6 * model->opt.timestep));
+    ImGui::Text("Simulation/Real time: %.2f", mj_sim_dt_average > 0 ? (1e6 * model->opt.timestep) / mj_sim_dt_average : 0.0);
     ImGui::Text("Wallclock time: %.2fs", wallclock);
+    int smplh_contacts = 0; double smplh_penetration = 0;
+    smplh_bridge_.latestContactStats(smplh_contacts, smplh_penetration);
+    ImGui::Text("SMPL-H contacts: %d | deepest %.1f mm", smplh_contacts, 1000.0 * smplh_penetration);
+    const auto smplh_distance = smplh_bridge_.snapshot();
+    if(smplh_distance.ready)
+      ImGui::Text("SMPL-H sample %llu | age %.1f ms | query %.1f ms | pairs %llu/%llu\nprep %.1f ms | collide %.1f ms | distance %.1f ms | SCH %.1f ms (%llu pruned) | %s",
+                   static_cast<unsigned long long>(smplh_distance.sequence),
+                   1000.0 * (data->time - smplh_distance.sample_simulation_time),
+                   1000.0 * smplh_distance.worker_duration_seconds,
+                   static_cast<unsigned long long>(smplh_distance.queried_pairs),
+                   static_cast<unsigned long long>(smplh_distance.total_pairs),
+                   1000.0 * smplh_distance.preparation_duration_seconds,
+                   1000.0 * smplh_distance.collision_duration_seconds,
+                   1000.0 * smplh_distance.distance_duration_seconds,
+                   1000.0 * smplh_distance.sch_duration_seconds,
+                   static_cast<unsigned long long>(smplh_distance.sch_pruned_pairs),
+                   smplh_distance.approximate ? "approximate" : "exact");
+    else ImGui::Text("SMPL-H distance sample: waiting");
     if(ImGui::Checkbox("Sync with real-time", &config.sync_real_time))
     {
       if(config.sync_real_time)
