@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -50,6 +51,7 @@ class SmplhBridge
   std::map<int, size_t> contactRegionByGeom_;
   bool dynamicContacts_ = true;
   smplh_contact::Snapshot contactForces_;
+  smplh_contact::Selection contactSelection_;
   std::array<double, 14> contactPeaks_{};
   std::ofstream contactCsv_;
   std::map<std::string, std::array<double, 2>> contactSizeScales_;
@@ -507,77 +509,84 @@ public:
       contactPeaks_[i] = std::max(contactPeaks_[i], contactForces_.positiveNormalSumN[i]);
     contactForces_.peakPositiveNormalSumN = contactPeaks_;
   }
-  // Estimate a single contact's normal force from Bastien's external-torque
-  // source. Subtract passive torque before projection: it is not contact load.
-  // The solved constraint Jacobian uses the same pre-integration state as the
-  // post-step torque sample, unlike mj_jac called after mj_step.
-  void captureTorqueEstimate(const mjModel * m, const mjData * d,
-                             const std::vector<int> & robotDofs, const std::string & robotPrefix)
+  void setContactSelection(const smplh_contact::Selection & selection) { contactSelection_ = selection; }
+
+  // Compare forces at the controller's currently selected closest point. The
+  // MuJoCo value is the normal component at the nearest solved manifold point;
+  // the torque value is the least-squares projection onto J(point)^T * (-normal).
+  void captureSelectedPointComparison(const mjModel * m, const mjData * d,
+                                      const std::vector<int> & robotDofs, const std::string & robotPrefix)
   {
-    double externalNorm2 = 0;
-    for(int dof : robotDofs)
-      if(dof >= 0 && dof < m->nv)
-      {
-        const double external = d->qfrc_constraint[dof] + d->qfrc_passive[dof];
-        externalNorm2 += external * external;
-      }
-    contactForces_.externalJointTorqueNormNm = std::sqrt(externalNorm2);
-    if(!contactForces_.valid || robotDofs.empty()) return;
-    int candidate = -1;
-    size_t region = 0;
-    int robotContacts = 0;
+    contactForces_.selectedPointValid = false;
+    if(!contactSelection_.valid || contactSelection_.region >= smplh_contact::regions.size()
+       || std::abs(d->time - contactSelection_.time) > 0.1
+       || robotDofs.empty()) return;
+    const auto & selection = contactSelection_;
+    int body = mj_name2id(m, mjOBJ_BODY, selection.robotBody.c_str());
+    if(body < 0)
+    {
+      std::string prefix = robotPrefix;
+      if(!prefix.empty() && prefix.back() != '_') prefix += '_';
+      body = mj_name2id(m, mjOBJ_BODY, (prefix + selection.robotBody).c_str());
+    }
+    if(body < 0) return;
+    mjtNum point[3] = {selection.position[0], selection.position[1], selection.position[2]};
+    mjtNum normal[3] = {selection.normal[0], selection.normal[1], selection.normal[2]};
+    if(!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])
+       || !std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) return;
+    if(mju_norm3(normal) < 1e-9) return;
+    mju_normalize3(normal);
+
+    int best = -1;
+    double bestDistance = std::numeric_limits<double>::infinity();
     for(int i = 0; i < d->ncon; ++i)
     {
       const auto & c = d->contact[i];
       if(c.efc_address < 0) continue;
-      int robotSide = -1;
-      for(int side = 0; side < 2; ++side)
-      {
-        const char * name = mj_id2name(m, mjOBJ_BODY, m->geom_bodyid[c.geom[side]]);
-        if(name && std::string(name).compare(0, robotPrefix.size(), robotPrefix) == 0)
-          robotSide = side;
-      }
-      if(robotSide < 0) continue;
-      ++robotContacts;
-      const auto it = contactRegionByGeom_.find(c.geom[1 - robotSide]);
-      if(it != contactRegionByGeom_.end()) { candidate = i; region = it->second; }
+      int humanSide = contactRegionByGeom_.count(c.geom[0]) ? 0 : contactRegionByGeom_.count(c.geom[1]) ? 1 : -1;
+      if(humanSide < 0 || contactRegionByGeom_.at(c.geom[humanSide]) != selection.region) continue;
+      if(m->geom_bodyid[c.geom[1-humanSide]] != body) continue;
+      const double distance = mju_dist3(c.pos, point);
+      if(distance < bestDistance) { best = i; bestDistance = distance; }
     }
-    if(robotContacts != 1 || candidate < 0) return;
-    const auto & contact = d->contact[candidate];
-    const int row = contact.efc_address;
-    const int rows = mj_isPyramidal(m) && contact.dim > 1 ? 2 * (contact.dim - 1) : 1;
-    if(row + rows > d->nefc) return;
-    const auto jacEntry = [&](int constraintRow, int dof) {
-      if(!mj_isSparse(m)) return static_cast<double>(d->efc_J[constraintRow * m->nv + dof]);
-      for(int k = 0; k < d->efc_J_rownnz[constraintRow]; ++k)
-      {
-        const int index = d->efc_J_rowadr[constraintRow] + k;
-        if(d->efc_J_colind[index] == dof) return static_cast<double>(d->efc_J[index]);
-      }
-      return 0.0;
-    };
-    double dot = 0, jacNorm2 = 0, torqueNorm2 = 0;
+    if(best < 0) return;
+
+    const auto & c = d->contact[best];
+    mjtNum wrench[6] = {};
+    mj_contactForce(m, d, best, wrench);
+    // Contact frame's first axis points from geom0 to geom1. The contact
+    // wrench is the force applied to geom1; orient it as force on the robot.
+    const int robotSide = m->geom_bodyid[c.geom[0]] == body ? 0 : 1;
+    const double sign = robotSide == 1 ? 1.0 : -1.0;
+    double worldForce[3] = {};
+    for(int axis = 0; axis < 3; ++axis)
+      for(int k = 0; k < 3; ++k) worldForce[k] += sign * wrench[axis] * c.frame[3*axis+k];
+    const double mujocoForce = std::max(0.0, -(worldForce[0]*normal[0] + worldForce[1]*normal[1]
+                                                + worldForce[2]*normal[2]));
+
+    std::vector<mjtNum> jacp(3 * m->nv), jacr(3 * m->nv);
+    mj_jac(m, d, jacp.data(), jacr.data(), point, body);
+    double dot = 0, norm2 = 0;
     for(int dof : robotDofs)
     {
       if(dof < 0 || dof >= m->nv) continue;
-      double jac = 0;
-      for(int k = 0; k < rows; ++k) jac += jacEntry(row + k, dof);
-      jac /= rows; // Pyramid rows combine normal and tangent directions.
-      const double external = d->qfrc_constraint[dof] + d->qfrc_passive[dof];
-      const double contactCandidate = external - d->qfrc_passive[dof];
-      dot += jac * contactCandidate;
-      jacNorm2 += jac * jac;
-      torqueNorm2 += contactCandidate * contactCandidate;
+      double jn = 0;
+      // The selected normal points robot-to-human; the contact force on the
+      // robot acts in the opposite direction.
+      for(int k = 0; k < 3; ++k) jn -= jacp[k*m->nv+dof] * normal[k];
+      const double external = d->qfrc_constraint[dof]; // passive torque is not contact load
+      dot += jn * external;
+      norm2 += jn * jn;
     }
-    if(jacNorm2 <= 1e-10 || torqueNorm2 <= 1e-12) return;
-    const double force = std::max(0.0, dot / jacNorm2);
-    const double residual = std::sqrt(std::max(0.0, torqueNorm2 - 2 * force * dot + force * force * jacNorm2));
-    const double relative = residual / std::sqrt(torqueNorm2);
-    contactForces_.torqueEstimateResidualNm = residual;
-    contactForces_.torqueEstimateRelativeResidual = relative;
-    contactForces_.torqueEstimatedNormalN[region] = force;
-    if(relative > 0.5) return;
-    contactForces_.torqueEstimateValid[region] = true;
+    if(norm2 <= 1e-12) return;
+    const double torqueForce = std::max(0.0, dot / norm2);
+    contactForces_.selectedPointValid = true;
+    contactForces_.selectedPointTime = d->time;
+    contactForces_.selectedRegion = selection.region;
+    contactForces_.selectedTorqueForceN = torqueForce;
+    contactForces_.selectedMujocoForceN = mujocoForce;
+    contactForces_.selectedForceDifferenceN = torqueForce - mujocoForce;
+    contactForces_.selectedContactPointDistanceM = bestDistance;
   }
   smplh_contact::Snapshot contactForces() const { return contactForces_; }
   void latestContactStats(int & count, double & deepest) const

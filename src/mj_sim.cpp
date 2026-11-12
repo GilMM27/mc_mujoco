@@ -1155,10 +1155,11 @@ bool MjSimImpl::controlStep()
       smplh_forces.highPassCompensation = robot->use_hp_filter_ext_torques && robot->hp_filter_ext_torques_gain < 0;
     }
     smplh_store.assign<smplh_contact::Snapshot>(smplh_contact::datastoreKey, smplh_forces);
-    if(!controller->run())
-    {
-      return true;
-    }
+    const bool controllerRunning = controller->run();
+    if(smplh_store.has(smplh_contact::selectionDatastoreKey))
+      smplh_bridge_.setContactSelection(
+          smplh_store.get<smplh_contact::Selection>(smplh_contact::selectionDatastoreKey));
+    if(!controllerRunning) return true;
     for(auto & r : robots)
     {
       r.updateControl(controller->robots().robot(r.name));
@@ -1224,7 +1225,7 @@ void MjSimImpl::simStep()
     for(size_t i = 0; i < selected->mj_jnt_ids.size(); ++i)
       if(selected->mj_mot_ids[i] >= 0 || selected->mj_pos_act_ids[i] >= 0)
         robotDofs.push_back(model->jnt_dofadr[selected->mj_jnt_ids[i]]);
-    smplh_bridge_.captureTorqueEstimate(model, data, robotDofs, selected->prefix);
+    smplh_bridge_.captureSelectedPointComparison(model, data, robotDofs, selected->prefix);
   }
   mj_forward(model, data);
   smplh_bridge_.update(model, data);
