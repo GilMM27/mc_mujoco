@@ -44,6 +44,9 @@ if(NOT DEFINED MUJOCO_ROOT_DIR)
 endif()
 
 find_package(mc_rtc REQUIRED)
+find_package(human_robot_distance_api 2 CONFIG REQUIRED)
+find_package(fcl REQUIRED)
+find_package(sch-core REQUIRED)
 find_package(CLI11 REQUIRED)
 
 option(USE_GL "Use Mujoco with OpenGL" ON)

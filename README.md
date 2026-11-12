@@ -1,5 +1,21 @@
 # mujoco interface for mc-rtc
 
+## SMPL-H contact measurements in this fork
+
+The [superbuild playback guide](https://github.com/GilMM27/safe-hri-mc-rtc-superbuild/blob/feat/smplh-contact-forces/smplh_playback/README.md)
+describes preparing a licensed motion cache and setting `SMPLH_CACHE`.
+`SmplhBridge` reads that cache, animates 14 contact capsules, and publishes
+`smplh_contact_forces` to the mc_rtc datastore. Each region's solved normal
+force sums positive `mj_contactForce` values immediately after `mj_step`.
+
+For exactly one solved robot–SMPL-H contact, the bridge also estimates normal
+force from the robot's external joint-torque source. It subtracts the passive
+term, projects the remaining constraint torque onto the contact's normal
+Jacobian, and rejects weak or poor fits. Pyramidal friction rows are averaged
+to recover the normal Jacobian. The snapshot provides the estimate, validity,
+and fit residual alongside the solved force. This comparison uses simulation
+data on both sides and is not a physical force measurement.
+
 ![Screenshot from 2022-08-12 17-09-16](https://user-images.githubusercontent.com/16384313/188832982-1a1263e4-ce33-4dc7-804a-589d151670b3.png)
 
 ## Usage
