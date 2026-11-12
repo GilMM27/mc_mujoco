@@ -1032,6 +1032,22 @@ void MjSimImpl::updateData()
   }
 }
 
+const MjRobot * MjSimImpl::contactRobot() const
+{
+  if(controller)
+  {
+    const auto & name = controller->controller().robot().name();
+    const auto it = std::find_if(robots.begin(), robots.end(),
+                                 [&](const MjRobot & robot) { return robot.name == name; });
+    if(it != robots.end()) return &*it;
+  }
+  const auto it = std::find_if(robots.begin(), robots.end(), [](const MjRobot & robot) {
+    return std::any_of(robot.mj_mot_ids.begin(), robot.mj_mot_ids.end(), [](int id) { return id >= 0; })
+           || std::any_of(robot.mj_pos_act_ids.begin(), robot.mj_pos_act_ids.end(), [](int id) { return id >= 0; });
+  });
+  return it == robots.end() ? nullptr : &*it;
+}
+
 void MjRobot::updateControl(const mc_rbdyn::Robot & robot)
 {
   mj_prev_ctrl_q = mj_next_ctrl_q;
@@ -1133,10 +1149,10 @@ bool MjSimImpl::controlStep()
     smplh_store.assign<human_robot_distance::Snapshot>(human_robot_distance::datastoreKey, smplh_bridge_.snapshot());
     if(!smplh_store.has(smplh_contact::datastoreKey)) smplh_store.make<smplh_contact::Snapshot>(smplh_contact::datastoreKey);
     auto smplh_forces = smplh_bridge_.contactForces();
-    if(!robots.empty())
+    if(const auto * robot = contactRobot())
     {
-      smplh_forces.externalTorqueFeedback = robots.front().use_external_torques;
-      smplh_forces.highPassCompensation = robots.front().use_hp_filter_ext_torques && robots.front().hp_filter_ext_torques_gain < 0;
+      smplh_forces.externalTorqueFeedback = robot->use_external_torques;
+      smplh_forces.highPassCompensation = robot->use_hp_filter_ext_torques && robot->hp_filter_ext_torques_gain < 0;
     }
     smplh_store.assign<smplh_contact::Snapshot>(smplh_contact::datastoreKey, smplh_forces);
     if(!controller->run())
@@ -1202,14 +1218,13 @@ void MjSimImpl::simStep()
   smplh_bridge_.guardPositionControls(model, data);
   mj_step(model, data);
   smplh_bridge_.captureContactStats(model, data);
-  if(!robots.empty())
+  if(const auto * selected = contactRobot())
   {
-    const auto & robot = robots.front();
     std::vector<int> robotDofs;
-    for(size_t i = 0; i < robot.mj_jnt_ids.size(); ++i)
-      if(robot.mj_mot_ids[i] >= 0 || robot.mj_pos_act_ids[i] >= 0)
-        robotDofs.push_back(model->jnt_dofadr[robot.mj_jnt_ids[i]]);
-    smplh_bridge_.captureTorqueEstimate(model, data, robotDofs, robot.prefix);
+    for(size_t i = 0; i < selected->mj_jnt_ids.size(); ++i)
+      if(selected->mj_mot_ids[i] >= 0 || selected->mj_pos_act_ids[i] >= 0)
+        robotDofs.push_back(model->jnt_dofadr[selected->mj_jnt_ids[i]]);
+    smplh_bridge_.captureTorqueEstimate(model, data, robotDofs, selected->prefix);
   }
   mj_forward(model, data);
   smplh_bridge_.update(model, data);
@@ -1260,10 +1275,10 @@ bool MjSimImpl::stepSimulation()
       smplh_paused_store.assign<human_robot_distance::Snapshot>(human_robot_distance::datastoreKey, smplh_bridge_.snapshot());
       if(!smplh_paused_store.has(smplh_contact::datastoreKey)) smplh_paused_store.make<smplh_contact::Snapshot>(smplh_contact::datastoreKey);
       auto smplh_forces = smplh_bridge_.contactForces();
-      if(!robots.empty())
+      if(const auto * robot = contactRobot())
       {
-        smplh_forces.externalTorqueFeedback = robots.front().use_external_torques;
-        smplh_forces.highPassCompensation = robots.front().use_hp_filter_ext_torques && robots.front().hp_filter_ext_torques_gain < 0;
+        smplh_forces.externalTorqueFeedback = robot->use_external_torques;
+        smplh_forces.highPassCompensation = robot->use_hp_filter_ext_torques && robot->hp_filter_ext_torques_gain < 0;
       }
       smplh_paused_store.assign<smplh_contact::Snapshot>(smplh_contact::datastoreKey, smplh_forces);
       controller->run();

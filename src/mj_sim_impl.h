@@ -235,6 +235,7 @@ struct MjSimImpl
 private:
   /** Controller instance in this simulation, might be null if the controller is disabled */
   std::unique_ptr<mc_control::MCGlobalController> controller;
+  const MjRobot * contactRobot() const;
 
 public:
   /** Configuration and data for the step-by-step mode */
