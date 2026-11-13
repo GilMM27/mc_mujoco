@@ -611,6 +611,7 @@ void MjSimImpl::setSimulationInitialState()
   }
   mj_forward(model, data);
   smplh_bridge_.configureContactSizes(controller->controller().config());
+  smplh_bridge_.configureDistanceGeometry(controller->controller().config());
   smplh_bridge_.update(model, data);
 }
 
