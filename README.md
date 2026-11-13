@@ -7,6 +7,13 @@ describes preparing a licensed motion cache and setting `SMPLH_CACHE`.
 `SmplhBridge` reads that cache, animates 14 contact capsules, and publishes
 `smplh_contact_forces` to the mc_rtc datastore. Each region's solved normal
 force sums positive `mj_contactForce` values immediately after `mj_step`.
+For SSM+PFL distance samples, `SSMPFL.SeparationGeometry` in the controller
+configuration selects `collision` (the default, using the 14 SMPL-H contact
+capsules scaled by `SMPLHContactSizes`) or `mesh` (the SMPL-H surface mesh).
+The Kinova geometry selection remains controlled by `SMPLH_ROBOT_GROUP`.
+Capsule mode uses the current MuJoCo capsule poses and the selected SCH or FCL distance backend;
+`SMPLH_CONTACT_MODE=off` cannot be used with it. Restart mc_mujoco after
+changing the setting.
 
 The controller writes its closest region/link witness, body, normal, and time
 to the `smplh_contact_selection` datastore entry. On the next MuJoCo step the

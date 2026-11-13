@@ -44,11 +44,13 @@ class SmplhBridge
   std::uint64_t sequence_ = 0;
   unsigned int steps_ = 0, distanceEvery_ = 25;
   bool distanceEnabled_ = true;
+  std::string distanceGeometry_ = "mesh";
   bool contactsEnabled_ = true;
   mjData * contactData_ = nullptr;
   std::vector<std::pair<int, int>> contactBodies_; // target mocap id, skeleton body id
   std::vector<int> contactFreeJoints_;
   std::map<int, size_t> contactRegionByGeom_;
+  std::map<std::string, int> contactGeomByRegion_;
   bool dynamicContacts_ = true;
   smplh_contact::Snapshot contactForces_;
   smplh_contact::Selection contactSelection_;
@@ -96,6 +98,7 @@ class SmplhBridge
         contactBodies_.emplace_back(mocap, m->jnt_bodyid[joints_[joint]]);
         contactFreeJoints_.push_back(freeJoint);
         contactRegionByGeom_[geom] = region++;
+        contactGeomByRegion_[smplh_contact::regions[region - 1]] = geom;
         geoms.push_back(geom);
       }
     }
@@ -271,13 +274,38 @@ class SmplhBridge
                          && std::string(std::getenv("SMPLH_DISTANCE_DISABLE")) == "1");
     configureContacts(m);
     if(distanceEnabled_)
+    {
+      std::vector<int> capsuleGeoms;
+      if(distanceGeometry_ == "collision")
+      {
+        if(!contactsEnabled_)
+          throw std::runtime_error("SSMPFL.SeparationGeometry=collision requires SMPLH_CONTACT_MODE to be enabled");
+        for(const auto & name : regionNames_)
+        {
+          const auto found = contactGeomByRegion_.find(name);
+          if(found == contactGeomByRegion_.end())
+            throw std::runtime_error("Missing SMPL-H contact capsule for distance region: " + name);
+          capsuleGeoms.push_back(found->second);
+        }
+      }
       distanceWorker_.configure(m, regionFaceIds_, regionNames_, faces_, prefix ? prefix : "kinova_", group,
-                                true);
+                                true, capsuleGeoms);
+    }
   }
 
 public:
   SmplhBridge() = default;
   SmplhBridge(const SmplhBridge &) = delete;
+  template<typename Config>
+  void configureDistanceGeometry(const Config & controllerConfig)
+  {
+    if(initialized_) throw std::runtime_error("Configure SMPL-H separation geometry before playback initialization");
+    distanceGeometry_ = controllerConfig.has("SSMPFL") ? "collision" : "mesh";
+    if(controllerConfig.has("SSMPFL"))
+      controllerConfig("SSMPFL")("SeparationGeometry", distanceGeometry_);
+    if(distanceGeometry_ != "mesh" && distanceGeometry_ != "collision")
+      throw std::runtime_error("SSMPFL.SeparationGeometry must be mesh or collision");
+  }
   template<typename Config>
   void configureContactSizes(const Config & controllerConfig)
   {
