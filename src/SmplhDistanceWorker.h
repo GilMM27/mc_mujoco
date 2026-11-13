@@ -91,6 +91,7 @@ struct SmplhQueryInput
   std::array<double, 7> robot_joint_velocities{};
   bool robot_joints_valid = false;
   std::vector<SmplhRobotPose> robot_poses;
+  std::vector<SmplhRobotPose> human_capsule_poses;
 };
 
 class SmplhDistanceWorker
@@ -114,6 +115,9 @@ class SmplhDistanceWorker
   std::uint32_t humanModelFrame_ = UINT32_MAX;
   std::vector<SmplhRobotGeom> robots_;
   std::vector<int> robotIds_;
+  std::vector<int> humanCapsuleIds_;
+  std::vector<std::shared_ptr<SmplhCollisionGeometry>> humanCapsules_;
+  std::vector<std::unique_ptr<sch::S_Object>> humanCapsuleSch_;
   std::vector<std::string> linkNames_{"all"};
   std::vector<std::vector<size_t>> linkRobotIndices_;
   bool useSch_ = false;
@@ -127,7 +131,8 @@ class SmplhDistanceWorker
   std::thread thread_;
 
   void decorateWitness(human_robot_distance::RegionDistance & candidate, size_t robotIndex,
-                       const Region & region, const SmplhQueryInput & input) const
+                       const Region & region, const SmplhQueryInput & input,
+                       const SmplhRobotPose * humanCapsulePose = nullptr) const
   {
     candidate.robot_body = robots_[robotIndex].body;
     candidate.link = linkNames_[robots_[robotIndex].link];
@@ -142,6 +147,18 @@ class SmplhDistanceWorker
     {
       candidate.robot_velocity = {robotVelocity.x(), robotVelocity.y(), robotVelocity.z()};
       candidate.robot_velocity_valid = true;
+    }
+    if(humanCapsulePose)
+    {
+      const Eigen::Vector3d humanPoint(candidate.human_point[0], candidate.human_point[1], candidate.human_point[2]);
+      const Eigen::Vector3d humanVelocity = humanCapsulePose->body_linear_velocity
+          + humanCapsulePose->body_angular_velocity.cross(humanPoint - humanCapsulePose->body_translation);
+      if(humanVelocity.allFinite())
+      {
+        candidate.human_velocity = {humanVelocity.x(), humanVelocity.y(), humanVelocity.z()};
+        candidate.human_velocity_valid = true;
+      }
+      return;
     }
     if(!input.velocity_valid || input.vertex_velocities.size() != input.vertices.size()) return;
     // The selected SCH hull point need not lie on a mesh triangle. Track the
@@ -358,11 +375,183 @@ class SmplhDistanceWorker
     }
   }
 
+  void queryCapsules(human_robot_distance::Snapshot & snapshot,
+                     const std::vector<std::unique_ptr<fcl::CollisionObjectd>> & robotObjects,
+                     const SmplhQueryInput & input) const
+  {
+    for(size_t regionIndex = 0; regionIndex < regions_.size(); ++regionIndex)
+    {
+      const auto & pose = input.human_capsule_poses.at(regionIndex);
+      Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+      transform.linear() = pose.rotation;
+      transform.translation() = pose.translation;
+      fcl::CollisionObjectd human(humanCapsules_[regionIndex], transform);
+      auto * schHuman = humanCapsuleSch_.empty() ? nullptr : humanCapsuleSch_[regionIndex].get();
+      if(schHuman)
+      {
+        const auto & r = pose.rotation;
+        const auto & t = pose.translation;
+        schHuman->setOrientation(r(0,0), r(0,1), r(0,2), r(1,0), r(1,1), r(1,2), r(2,0), r(2,1), r(2,2));
+        schHuman->setPosition(t.x(), t.y(), t.z());
+      }
+      for(size_t link = 0; link < linkNames_.size(); ++link)
+      {
+        std::vector<std::pair<double, size_t>> candidates;
+        for(size_t robot : linkRobotIndices_[link])
+          candidates.emplace_back(human.getAABB().distance(robotObjects[robot]->getAABB()), robot);
+        std::sort(candidates.begin(), candidates.end());
+        bool have = false;
+        double bestDistance = std::numeric_limits<double>::infinity();
+        size_t bestRobot = robots_.size();
+        human_robot_distance::RegionDistance best;
+        for(const auto & entry : candidates)
+        {
+          if(have && entry.first > bestDistance + 1e-9) break;
+          const size_t robotIndex = entry.second;
+          auto & robot = *robotObjects[robotIndex];
+          ++snapshot.queried_pairs;
+          human_robot_distance::RegionDistance candidate;
+          candidate.region = regions_[regionIndex].name;
+          candidate.robot_geometry = robots_[robotIndex].name;
+          if(schHuman)
+          {
+            sch::CD_Pair pair(schHuman, robots_[robotIndex].sch_geometry.get());
+            pair.setRelativePrecision(1e-6);
+            const auto start = std::chrono::steady_clock::now();
+            const double squared = pair.getDistanceWithoutPenetrationDepth();
+            if(!std::isfinite(squared)) throw std::runtime_error("SCH capsule distance failed");
+            sch::Point3 humanPoint, robotPoint;
+            const double witnessSquared = pair.getClosestPoints(humanPoint, robotPoint);
+            if(!std::isfinite(witnessSquared)) throw std::runtime_error("SCH capsule witness query failed");
+            candidate.human_point = {humanPoint.m_x, humanPoint.m_y, humanPoint.m_z};
+            candidate.robot_point = {robotPoint.m_x, robotPoint.m_y, robotPoint.m_z};
+            candidate.closest_points_valid = true;
+            if(squared <= 1e-18)
+            {
+              candidate.distance = 0;
+              candidate.intersecting = true;
+              const auto & separation = pair.getVector();
+              Eigen::Vector3d direction(separation.m_x, separation.m_y, separation.m_z);
+              if(direction.allFinite() && direction.norm() > 1e-12)
+              {
+                direction.normalize();
+                candidate.direction = {direction.x(), direction.y(), direction.z()};
+                candidate.direction_valid = true;
+              }
+              // SCH can report a near-zero separation for an actual overlap.
+              // Ask FCL for the contact normal only for these rare pairs.
+              fcl::CollisionRequestd contactRequest(1, true);
+              fcl::CollisionResultd contactResult;
+              const auto contactStart = std::chrono::steady_clock::now();
+              fcl::collide(&human, &robot, contactRequest, contactResult);
+              snapshot.collision_duration_seconds +=
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - contactStart).count();
+              if(contactResult.numContacts() > 0)
+              {
+                const auto & contact = contactResult.getContact(0);
+                const Eigen::Vector3d normal = contact.normal;
+                const Eigen::Vector3d position = contact.pos;
+                if(normal.allFinite() && position.allFinite() && normal.norm() > 1e-12)
+                {
+                  const Eigen::Vector3d unit = normal.normalized();
+                  candidate.human_point = {position.x(), position.y(), position.z()};
+                  candidate.robot_point = candidate.human_point;
+                  candidate.direction = {unit.x(), unit.y(), unit.z()};
+                  candidate.direction_valid = true;
+                }
+              }
+            }
+            else
+            {
+              candidate.distance = std::sqrt(witnessSquared);
+              Eigen::Vector3d delta(robotPoint.m_x-humanPoint.m_x,
+                                    robotPoint.m_y-humanPoint.m_y,
+                                    robotPoint.m_z-humanPoint.m_z);
+              if(delta.norm() > 1e-12)
+              {
+                delta.normalize();
+                candidate.direction = {delta.x(), delta.y(), delta.z()};
+                candidate.direction_valid = true;
+              }
+            }
+            snapshot.sch_duration_seconds +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+          }
+          else
+          {
+            fcl::CollisionRequestd collisionRequest(1, true);
+            fcl::CollisionResultd collisionResult;
+            const auto collisionStart = std::chrono::steady_clock::now();
+            const bool intersecting = fcl::collide(&human, &robot, collisionRequest, collisionResult) > 0;
+            snapshot.collision_duration_seconds +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - collisionStart).count();
+            if(intersecting)
+            {
+              candidate.distance = 0;
+              candidate.intersecting = true;
+              if(collisionResult.numContacts() > 0)
+              {
+                const auto & contact = collisionResult.getContact(0);
+                const Eigen::Vector3d normal = contact.normal;
+                const Eigen::Vector3d position = contact.pos;
+                if(normal.allFinite() && position.allFinite() && normal.norm() > 1e-12)
+                {
+                  const Eigen::Vector3d direction = normal.normalized();
+                  candidate.human_point = {position.x(), position.y(), position.z()};
+                  candidate.robot_point = candidate.human_point;
+                  candidate.closest_points_valid = true;
+                  candidate.direction = {direction.x(), direction.y(), direction.z()};
+                  candidate.direction_valid = true;
+                }
+              }
+            }
+            else
+            {
+              fcl::DistanceRequestd request(true);
+              fcl::DistanceResultd result;
+              const auto distanceStart = std::chrono::steady_clock::now();
+              candidate.distance = fcl::distance(&human, &robot, request, result);
+              snapshot.distance_duration_seconds +=
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - distanceStart).count();
+              if(!std::isfinite(candidate.distance) || candidate.distance < 0) continue;
+              const auto humanPoint = result.nearest_points[0];
+              const auto robotPoint = result.nearest_points[1];
+              candidate.human_point = {humanPoint.x(), humanPoint.y(), humanPoint.z()};
+              candidate.robot_point = {robotPoint.x(), robotPoint.y(), robotPoint.z()};
+              candidate.closest_points_valid = true;
+              Eigen::Vector3d delta = robotPoint - humanPoint;
+              if(delta.norm() > 1e-12)
+              {
+                delta.normalize();
+                candidate.direction = {delta.x(), delta.y(), delta.z()};
+                candidate.direction_valid = true;
+              }
+            }
+          }
+          if(!have || candidate.distance < bestDistance
+             || (candidate.distance == bestDistance && candidate.direction_valid && !best.direction_valid))
+          {
+            have = true;
+            bestDistance = candidate.distance;
+            bestRobot = robotIndex;
+            best = std::move(candidate);
+          }
+          if(bestDistance == 0 && best.direction_valid && best.closest_points_valid) break;
+        }
+        if(have)
+        {
+          decorateWitness(best, bestRobot, regions_[regionIndex], input, &pose);
+          snapshot.regions.push_back(std::move(best));
+        }
+      }
+    }
+  }
+
   human_robot_distance::Snapshot query(const SmplhQueryInput & input)
   {
     const auto preparationStart = std::chrono::steady_clock::now();
     human_robot_distance::Snapshot snapshot;
-    if(input.frame != humanModelFrame_)
+    if(humanCapsules_.empty() && input.frame != humanModelFrame_)
     {
       for(size_t i=0;i<regions_.size();++i)
       {
@@ -425,9 +614,15 @@ class SmplhDistanceWorker
     }
     snapshot.total_pairs = 0;
     for(const auto & region : regions_)
-      snapshot.total_pairs += (approximateSch_ ? region.patches.size() : 1) * robots_.size();
+      snapshot.total_pairs += ((approximateSch_ && humanCapsules_.empty()) ? region.patches.size() : 1) * robots_.size();
     snapshot.preparation_duration_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now()-preparationStart).count();
+    if(!humanCapsules_.empty())
+    {
+      snapshot.approximate = approximateSch_;
+      queryCapsules(snapshot, robotObjects, input);
+      return snapshot;
+    }
     if(approximateSch_)
     {
       queryApproximate(snapshot, robotObjects, input);
@@ -557,15 +752,33 @@ public:
   ~SmplhDistanceWorker() { {std::lock_guard<std::mutex> lock(mutex_); stopping_=true;} cv_.notify_one(); if(thread_.joinable()) thread_.join(); }
   void configure(const mjModel * m, const std::vector<std::vector<uint32_t>> & regionFaces,
                  const std::vector<std::string> & regionNames, const uint32_t * faces,
-                 const char * prefix="kinova_", int group=2, bool perLink=false)
+                 const char * prefix="kinova_", int group=2, bool perLink=false,
+                 const std::vector<int> & humanCapsuleIds={})
   {
     if(regionFaces.size()!=regionNames.size()) throw std::runtime_error("SMPL-H region metadata mismatch");
+    if(!humanCapsuleIds.empty() && humanCapsuleIds.size() != regionNames.size())
+      throw std::runtime_error("SMPL-H contact capsule count does not match distance regions");
+    humanCapsuleIds_ = humanCapsuleIds;
+    for(int id : humanCapsuleIds_)
+    {
+      if(id < 0 || id >= m->ngeom || m->geom_type[id] != mjGEOM_CAPSULE)
+        throw std::runtime_error("Invalid SMPL-H contact capsule for separation measurement");
+      const auto * size = m->geom_size + 3 * id;
+      humanCapsules_.push_back(std::make_shared<fcl::Capsuled>(size[0], 2 * size[1]));
+    }
     const char * schSetting = std::getenv("SMPLH_DISTANCE_USE_SCH");
     useSch_ = schSetting && std::string(schSetting) == "1";
     const char * mode = std::getenv("SMPLH_DISTANCE_MODE");
     if(mode && std::string(mode) != "fcl" && std::string(mode) != "sch_approx")
       throw std::runtime_error("SMPLH_DISTANCE_MODE must be fcl or sch_approx");
     approximateSch_ = !mode || std::string(mode) == "sch_approx";
+    if(approximateSch_)
+      for(int id : humanCapsuleIds_)
+      {
+        const auto * size = m->geom_size + 3 * id;
+        humanCapsuleSch_.push_back(std::make_unique<sch::S_Capsule>(sch::Point3(0, 0, -size[1]),
+                                                                    sch::Point3(0, 0, size[1]), size[0]));
+      }
     if(approximateSch_)
     {
       useSch_ = false;
@@ -597,7 +810,7 @@ public:
       }
       if(region.triangles.empty()) throw std::runtime_error("Empty SMPL-H region: "+region.name);
       region.vertices.resize(region.vertexIds.size());
-      if(approximateSch_) buildPatches(region);
+      if(approximateSch_ && humanCapsuleIds_.empty()) buildPatches(region);
       regions_.push_back(std::move(region));
     }
     std::string wanted=prefix?prefix:"";
@@ -620,7 +833,7 @@ public:
     {
       const int bodyId = m->geom_bodyid[i];
       const char * body=mj_id2name(m,mjOBJ_BODY,bodyId);
-      if(!body || m->geom_group[i]!=group || (!wanted.empty() && std::string(body).compare(0,wanted.size(),wanted)!=0)) continue;
+      if(!body || m->geom_group[i] != group || (!wanted.empty() && std::string(body).compare(0,wanted.size(),wanted)!=0)) continue;
       size_t link = 0;
       if(perLink)
       {
@@ -690,6 +903,21 @@ public:
         }
         input->vertex_velocities.push_back(velocity);
       }
+    }
+    input->human_capsule_poses.reserve(humanCapsuleIds_.size());
+    for(int id : humanCapsuleIds_)
+    {
+      SmplhRobotPose pose;
+      pose.rotation = Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>(data->geom_xmat + 9*id);
+      pose.translation = Eigen::Map<const Eigen::Vector3d>(data->geom_xpos + 3*id);
+      const int bodyId = model->geom_bodyid[id];
+      pose.body_rotation = Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>(data->xmat + 9*bodyId);
+      pose.body_translation = Eigen::Map<const Eigen::Vector3d>(data->xpos + 3*bodyId);
+      mjtNum velocity[6];
+      mj_objectVelocity(model, data, mjOBJ_BODY, bodyId, velocity, 0);
+      pose.body_angular_velocity = Eigen::Vector3d(velocity[0], velocity[1], velocity[2]);
+      pose.body_linear_velocity = Eigen::Vector3d(velocity[3], velocity[4], velocity[5]);
+      input->human_capsule_poses.push_back(pose);
     }
     input->robot_poses.reserve(robots_.size());
     for(size_t j=0;j<robots_.size();++j)
